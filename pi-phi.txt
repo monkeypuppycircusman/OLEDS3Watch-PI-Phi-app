@@ -1,0 +1,96 @@
+pi-phi
+// ================================================
+// Phi-Π Portal Resonator - 1-Shot Copy-Paste Block
+// Tinfoil Labs | 1 Hz φ / 0 Hz π Resonator
+// Hardware: Waveshare ESP32-S3-Touch-AMOLED-2.06
+// Framework: ESP-Brookesia + LVGL
+// Core Derivation: L = 1/(φ π) ≈ 0.1967 (minimal stable shear scale)
+// ================================================
+
+#include "esp_brookesia.h"
+#include "lvgl.h"
+#include <math.h>
+
+// ------------------- PHI-PI CONSTANTS -------------------
+static const float PHI = (1.0f + sqrtf(5.0f)) / 2.0f;  // Golden ratio ≈ 1.618034
+static const float PI_VAL = 3.1415926535f;
+static const float L_SCALE = 1.0f / (PHI * PI_VAL);    // ≈ 0.196726  (characteristic length)
+
+// ------------------- LVGL OBJECTS -------------------
+static lv_obj_t *portal_label;
+static lv_obj_t *amp_bar;
+static lv_timer_t *resonator_timer;
+
+// ------------------- COMPUTE PHI-PI AMPLITUDE -------------------
+// 1 Hz golden shear oscillation + static pi-derived offset
+float compute_phi_pi_amplitude(void) {
+    static uint32_t last_tick = 0;
+    uint32_t t_ms = lv_tick_get();
+    if (t_ms == last_tick) return 0.0f;  // avoid div0 on first call
+    last_tick = t_ms;
+
+    float t = t_ms / 1000.0f;                    // time in seconds
+    float phi_drive = sinf(2.0f * PI_VAL * t * 1.0f);  // pure 1 Hz φ drive
+    float amp = fabsf(phi_drive) * L_SCALE + 0.15f;    // baseline + shear scale
+
+    return fminf(amp, 1.0f);  // normalize to [0,1] for UI
+}
+
+// ------------------- TIMER CALLBACK (1 Hz) -------------------
+static void resonator_timer_cb(lv_timer_t *timer) {
+    float amp = compute_phi_pi_amplitude();
+
+    // Update amplitude bar
+    lv_bar_set_value(amp_bar, (int32_t)(amp * 100), LV_ANIM_ON);
+
+    // Portal pulse when above threshold (resonance hit)
+    if (amp > 0.65f) {
+        lv_obj_set_style_text_color(portal_label, lv_color_hex(0x00FFAA), 0);  // bright pulse
+        // TODO: Trigger haptic motor here (e.g. via GPIO or ESP-Brookesia vibration API)
+        // esp_rom_delay_us(50000); // example short vibe
+    } else {
+        lv_obj_set_style_text_color(portal_label, lv_color_hex(0x00AA66), 0);  // dim idle
+    }
+
+    // Optional: log to serial for tuning
+    // ESP_LOGI("RESONATOR", "Amp: %.4f | L_scale: %.6f", amp, L_SCALE);
+}
+
+// ------------------- UI SETUP -------------------
+void setup_phi_pi_resonator_ui(void) {
+    // Background
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x000011), 0);
+
+    // Portal Title
+    portal_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(portal_label, "Φ-Π PORTAL");
+    lv_obj_set_style_text_font(portal_label, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(portal_label, lv_color_hex(0x00AA66), 0);
+    lv_obj_align(portal_label, LV_ALIGN_TOP_MID, 0, 30);
+
+    // Amplitude Bar (visual shear indicator)
+    amp_bar = lv_bar_create(lv_scr_act());
+    lv_obj_set_size(amp_bar, 200, 30);
+    lv_obj_align(amp_bar, LV_ALIGN_CENTER, 0, 20);
+    lv_bar_set_range(amp_bar, 0, 100);
+    lv_bar_set_value(amp_bar, 20, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(amp_bar, lv_color_hex(0x112233), 0);
+    lv_obj_set_style_bg_grad_color(amp_bar, lv_color_hex(0x00FFAA), 0);
+    lv_obj_set_style_bg_grad_dir(amp_bar, LV_GRAD_DIR_HOR, 0);
+
+    // Status label
+    lv_obj_t *status = lv_label_create(lv_scr_act());
+    lv_label_set_text(status, "1 Hz φ DRIVE | 0 Hz π SHEAR");
+    lv_obj_set_style_text_font(status, &lv_font_montserrat_14, 0);
+    lv_obj_align(status, LV_ALIGN_BOTTOM_MID, 0, -40);
+}
+
+// ------------------- MAIN INIT (call from your app) -------------------
+void init_phi_pi_portal_resonator(void) {
+    setup_phi_pi_resonator_ui();
+
+    // Create 1-second resonator timer
+    resonator_timer = lv_timer_create(resonator_timer_cb, 1000, NULL);
+
+    ESP_LOGI("PHI_PI", "Portal Resonator armed | L = 1/(φπ) ≈ %.6f", L_SCALE);
+}
