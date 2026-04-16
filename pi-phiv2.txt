@@ -1,0 +1,189 @@
+CPP
+
+#include "esp_brookesia.hpp"
+#include "lvgl.h"
+#include "driver/i2c.h"
+#include "esp_log.h"
+#include <cmath>
+
+static const char *TAG = "PhiPiPortal";
+
+// ─── Phi-π resonance math ────────────────────────────────────────────────────
+// The quartz crystal in the PCF85063 RTC oscillates at 32.768 kHz
+// 32768 = 2^15, so we sync our resonance kernel to RTC tick intervals.
+// φ (golden ratio) ≈ 1.6180339887
+// π ≈ 3.14159265358
+// We compute a phase accumulator that advances by φ*π radians per tick,
+// then return the absolute amplitude of the resulting sinusoidal resonance.
+
+static constexpr float PHI  = 1.6180339887f;
+static constexpr float PI_F = 3.14159265358f;
+static constexpr float PHI_PI = PHI * PI_F;  // ≈ 5.0832...
+
+static float  s_phase        = 0.0f;   // persistent phase accumulator
+static uint32_t s_tick_count = 0;
+
+static float compute_phi_pi_amplitude() {
+    // Advance phase by φ·π radians each kernel tick (1 second)
+    s_phase += PHI_PI;
+    if (s_phase > 2.0f * PI_F * 1000.0f) s_phase -= 2.0f * PI_F * 1000.0f; // prevent overflow
+
+    s_tick_count++;
+
+    // Resonance: superposition of φ and π harmonics locked to RTC crystal
+    // f1 = sin(φ · phase), f2 = sin(π · phase / φ) — forms a Lissajous-style resonance
+    float f1 = sinf(PHI * s_phase);
+    float f2 = sinf(PI_F * s_phase / PHI);
+    float resonance = (f1 + f2) * 0.5f;          // range [-1, 1]
+    float amplitude = fabsf(resonance);            // range [0, 1]
+
+    ESP_LOGD(TAG, "tick=%lu phase=%.4f amp=%.4f", s_tick_count, s_phase, amplitude);
+    return amplitude;
+}
+
+// ─── Haptic / audio pulse via ES8311 ─────────────────────────────────────────
+// The board has no separate haptic motor GPIO. Use a short tone burst
+// through the ES8311 codec as the "pulse" signal.
+// (Assumes your BSP has already initialised the codec and speaker.)
+static void trigger_resonance_pulse(float amplitude) {
+    // Scale pulse intensity to amplitude [0.0 – 1.0]
+    // A real implementation would call bsp_audio_play() or i2s_write() here.
+    // For now we log so you can wire in your BSP call:
+    ESP_LOGI(TAG, "PULSE amp=%.3f — wire bsp_audio_play() here", amplitude);
+    // Example BSP call (uncomment once your audio BSP is wired up):
+    // bsp_codec_set_fs(16000, 16, 1);
+    // int16_t tone[160] = {0}; // 10ms @ 16kHz
+    // for (int i = 0; i < 160; i++)
+    //     tone[i] = (int16_t)(amplitude * 32767.0f * sinf(2*PI_F*440.0f*i/16000.0f));
+    // bsp_audio_play((uint8_t*)tone, sizeof(tone), portMAX_DELAY);
+}
+
+// ─── Brookesia App class ──────────────────────────────────────────────────────
+class PhiPiPortalApp : public ESP_Brookesia_PhoneApp {
+public:
+    PhiPiPortalApp()
+        : ESP_Brookesia_PhoneApp("Phi-Pi Portal", true) {}
+
+    bool run() override {
+        build_ui();
+        return true;
+    }
+
+    bool back() override {
+        // Let Brookesia handle the back navigation
+        return true;
+    }
+
+    bool close() override {
+        if (_kernel_timer) {
+            lv_timer_del(_kernel_timer);
+            _kernel_timer = nullptr;
+        }
+        return true;
+    }
+
+private:
+    lv_timer_t *_kernel_timer = nullptr;
+    lv_obj_t   *_amp_label    = nullptr;
+    lv_obj_t   *_phase_label  = nullptr;
+    lv_obj_t   *_tick_label   = nullptr;
+    lv_obj_t   *_glow_ring    = nullptr;
+
+    void build_ui() {
+        lv_obj_t *scr = lv_scr_act();
+        lv_obj_set_style_bg_color(scr, lv_color_hex(0x0A0010), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+
+        // ── Title ────────────────────────────────────────────────────────────
+        lv_obj_t *title = lv_label_create(scr);
+        lv_label_set_text(title, "Φ-π Portal");
+        lv_obj_set_style_text_color(title, lv_color_hex(0xCC88FF), LV_PART_MAIN);
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+
+        // ── Glow ring (visual resonance indicator) ────────────────────────
+        _glow_ring = lv_obj_create(scr);
+        lv_obj_set_size(_glow_ring, 160, 160);
+        lv_obj_align(_glow_ring, LV_ALIGN_CENTER, 0, -10);
+        lv_obj_set_style_radius(_glow_ring, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(_glow_ring, lv_color_hex(0x1A0033), LV_PART_MAIN);
+        lv_obj_set_style_border_color(_glow_ring, lv_color_hex(0x6600CC), LV_PART_MAIN);
+        lv_obj_set_style_border_width(_glow_ring, 3, LV_PART_MAIN);
+        lv_obj_set_style_shadow_color(_glow_ring, lv_color_hex(0x9900FF), LV_PART_MAIN);
+        lv_obj_set_style_shadow_width(_glow_ring, 20, LV_PART_MAIN);
+        lv_obj_set_style_shadow_spread(_glow_ring, 5, LV_PART_MAIN);
+
+        // ── Amplitude label (inside ring) ─────────────────────────────────
+        _amp_label = lv_label_create(_glow_ring);
+        lv_label_set_text(_amp_label, "0.000");
+        lv_obj_set_style_text_color(_amp_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+        lv_obj_set_style_text_font(_amp_label, &lv_font_montserrat_28, LV_PART_MAIN);
+        lv_obj_align(_amp_label, LV_ALIGN_CENTER, 0, -10);
+
+        lv_obj_t *amp_unit = lv_label_create(_glow_ring);
+        lv_label_set_text(amp_unit, "amplitude");
+        lv_obj_set_style_text_color(amp_unit, lv_color_hex(0x9966CC), LV_PART_MAIN);
+        lv_obj_set_style_text_font(amp_unit, &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_align(amp_unit, LV_ALIGN_CENTER, 0, 16);
+
+        // ── Phase + tick labels ───────────────────────────────────────────
+        _phase_label = lv_label_create(scr);
+        lv_label_set_text(_phase_label, "φ·π phase: 0.000");
+        lv_obj_set_style_text_color(_phase_label, lv_color_hex(0x88AAFF), LV_PART_MAIN);
+        lv_obj_set_style_text_font(_phase_label, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_obj_align(_phase_label, LV_ALIGN_BOTTOM_MID, 0, -55);
+
+        _tick_label = lv_label_create(scr);
+        lv_label_set_text(_tick_label, "RTC ticks: 0");
+        lv_obj_set_style_text_color(_tick_label, lv_color_hex(0x558899), LV_PART_MAIN);
+        lv_obj_set_style_text_font(_tick_label, &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_align(_tick_label, LV_ALIGN_BOTTOM_MID, 0, -35);
+
+        // ── Back button ───────────────────────────────────────────────────
+        lv_obj_t *back_btn = lv_btn_create(scr);
+        lv_obj_set_size(back_btn, 80, 36);
+        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+        lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x330055), LV_PART_MAIN);
+        lv_obj_set_style_radius(back_btn, 18, LV_PART_MAIN);
+        lv_obj_t *back_lbl = lv_label_create(back_btn);
+        lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
+        lv_obj_center(back_lbl);
+        lv_obj_add_event_cb(back_btn, [](lv_event_t *e) {
+            auto *app = (PhiPiPortalApp *)lv_event_get_user_data(e);
+            app->back();
+        }, LV_EVENT_CLICKED, this);
+
+        // ── Kernel timer: 1 tick = 1 RTC second (32768 crystal cycles) ───
+        _kernel_timer = lv_timer_create(kernel_tick_cb, 1000, this);
+    }
+
+    static void kernel_tick_cb(lv_timer_t *timer) {
+        auto *app = (PhiPiPortalApp *)timer->user_data;
+        if (!app) return;
+
+        float amp = compute_phi_pi_amplitude();
+
+        // Update amplitude display
+        lv_label_set_text_fmt(app->_amp_label, "%.3f", amp);
+        lv_label_set_text_fmt(app->_phase_label, "φ·π phase: %.2f", s_phase);
+        lv_label_set_text_fmt(app->_tick_label, "RTC ticks: %lu", s_tick_count);
+
+        // Map amplitude [0,1] → glow ring colour (cool blue → hot violet)
+        uint8_t r = (uint8_t)(amp * 180);
+        uint8_t g = (uint8_t)(amp * 20);
+        uint8_t b = (uint8_t)(80 + amp * 175);
+        lv_obj_set_style_bg_color(app->_glow_ring, lv_color_make(r, g, b), LV_PART_MAIN);
+
+        // Glow shadow intensity scales with amplitude
+        lv_obj_set_style_shadow_width(app->_glow_ring, (lv_coord_t)(10 + amp * 40), LV_PART_MAIN);
+
+        // Resonance threshold pulse (φ·π ≈ 5.083 → amplitude spikes near 1.0)
+        if (amp > 0.85f) {
+            trigger_resonance_pulse(amp);
+            // Flash ring border gold on resonance peak
+            lv_obj_set_style_border_color(app->_glow_ring, lv_color_hex(0xFFCC00), LV_PART_MAIN);
+        } else {
+            lv_obj_set_style_border_color(app->_glow_ring, lv_color_hex(0x6600CC), LV_PART_MAIN);
+        }
+    }
+};
